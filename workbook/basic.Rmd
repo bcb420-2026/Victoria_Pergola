@@ -1,0 +1,54 @@
+---
+title: "basic"
+output: html_document
+---
+
+create a 5 by 10 matrix of random integers
+```{r}
+set.seed(67)
+
+counts <- matrix(
+  sample(1:100, size = 5 * 10, replace = TRUE),
+  nrow = 5,
+  ncol = 10
+)
+```
+
+define column names as cond1, cond2, cond3, cond4, cond5, ctrl1, ctrl2, ctrl3, ctrl4, ctrl5
+```{r}
+colnames(counts) <- c(
+  paste0("cond", 1:5),
+  paste0("ctrl", 1:5)
+)
+```
+
+define row names as gene1, gene2, gene3 ...
+```{r}
+rownames(counts) <- paste0("gene", 1:5)
+```
+
+View the current matrix
+```{r}
+counts
+```
+
+Compute the fold change for each gene.
+```{r}
+# get mean expression for each (cond and ctrl)
+cond_mean <- rowMeans(counts[, 1:5])
+ctrl_mean <- rowMeans(counts[, 6:10])
+
+# calculate fold change
+fold_change <- cond_mean / ctrl_mean
+
+
+# combine results into a df
+results <- data.frame(
+  gene = rownames(counts),
+  cond_mean = cond_mean,
+  ctrl_mean = ctrl_mean,
+  fold_change = fold_change
+)
+
+results
+```
