@@ -1,1 +1,4 @@
 .DS_Store
+
+# GEOmetadb database (large, generated locally)
+**/GEOmetadb.sqlite
