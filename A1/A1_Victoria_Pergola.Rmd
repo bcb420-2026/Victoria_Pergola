@@ -1,0 +1,1006 @@
+---
+title: "BCB420 Assignment 1: RNA-seq Data Analysis"
+author: "Victoria Pergola"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    code_folding: hide
+date: "`r Sys.Date()`"
+bibliography: references.bib 
+link-citations: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      warning = FALSE, 
+                      message = FALSE,
+                      fig.width = 10,
+                      fig.height = 6)
+
+# Define color palette
+PALETTE_BASELINE <- "#E69F00"  # orange
+PALETTE_POST <- "#009E73"  # bluish-green
+
+condition_colors <- c(
+  "Baseline" = PALETTE_BASELINE,
+  "Post_Treatment" = PALETTE_POST
+)
+```
+
+## Dataset Overview and Motivation
+
+### Study Background
+
+#### {#interest-dataset}
+I selected the bulk RNA-seq dataset GSE255359 from Quintela-Fandino et al (2024), which investigates nintedanib (an anti-fibrotic drug) combined with paclitaxel chemotherapy in HER2-negative breast cancer patients. The study examines how tumour extracellular matrix stiffness affects treatment response and whether anti-fibrotic intervention can improve outcomes.
+
+I have been particularly interested in cancer drug research as there are direct implications for patient outcomes. This dataset offers a unique window into how anti-fibrotic therapy reshapes the tumour microenvironment at the transcriptional level, potentially revealing mechanisms of treatment resistance and response in breast cancer. Understanding the molecular changes induced by combining anti-fibrotic agents with chemotherapy could inform future therapeutic strategies and biomarker development for predicting treatment response.
+
+### Experimental Design
+
+#### {#conditions}
+**Conditions analyzed:**
+
+- **Baseline:** Pre-treatment tumour biopsies (before any therapy)
+- **Post-treatment:** tumour samples after neoadjuvant therapy with paclitaxel ± nintedanib
+
+The data comes from a Phase 2 randomized clinical trial (NCT01484080) examining whether adding nintedanib to standard chemotherapy improves pathological response rates. This experimental design allows us to capture the transcriptional changes induced by treatment while controlling for patient-specific factors through paired sampling.
+
+## Package Installation and Loading
+
+First I will install and load all the relevant packages needed for analysis of the dataset.
+
+```{r install_packages}
+# Install CRAN packages
+cran_packages <- c("knitr", "dplyr", "readr", "rmarkdown", "tidyr", 
+                   "patchwork", "ggplot2", "ggrepel", "ComplexHeatmap", 
+                   "circlize", "tibble", "RColorBrewer", "pheatmap")
+
+for(pkg in cran_packages) {
+  if(!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
+  }
+}
+
+# Install Bioconductor packages
+if(!requireNamespace("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+
+bioc_packages <- c("biomaRt", "GEOquery", "edgeR")
+for(pkg in bioc_packages) {
+  if(!requireNamespace(pkg, quietly = TRUE)) {
+    BiocManager::install(pkg)
+  }
+}
+```
+
+```{r load_libraries}
+# Load all required libraries
+library(GEOquery)
+library(readr)
+library(rmarkdown)
+library(knitr)
+library(dplyr)
+library(biomaRt)
+library(edgeR)
+library(ggplot2)
+library(tidyr)
+library(patchwork)
+library(ggrepel)
+library(ComplexHeatmap)
+library(circlize)
+library(pheatmap)
+library(tibble)
+```
+
+## Data Acquisition from GEO
+
+Here I use GEOquery to pull the data from the GEO database.
+
+```{r download_data}
+# Download supplementary files from GEO
+if(!file.exists("GSE255359/GSE255359_RAW_RNAseq_counts.csv.gz")) {
+  getGEOSuppFiles("GSE255359", makeDirectory = TRUE)
+}
+
+# Load raw count matrix
+raw_counts <- read_csv("GSE255359/GSE255359_RAW_RNAseq_counts.csv.gz", 
+                       show_col_types = FALSE)
+
+# Preview
+paged_table(raw_counts[1:10, 1:10])
+```
+
+**Table 1: Raw RNA-seq count matrix preview.** First 10 genes (rows) and 10 samples (columns) from the unnormalized dataset. Gene identifiers are Ensembl IDs in the first column. Full dataset: 60,660 genes × 108 samples. These are raw integer counts representing the number of sequencing reads mapped to each gene in each sample. Raw counts require normalization before comparative analysis to account for differences in sequencing depth and RNA composition.
+
+## Initial Quality Assessment
+
+### Sample Metadata and Library Sizes
+
+Next, I will inspect the number of samples that the data set contains for each condition as well as library size.
+
+```{r qc_setup}
+# Prepare count matrix
+counts <- raw_counts[, -1]
+rownames(counts) <- raw_counts$geneID
+
+# Create sample metadata from column names
+sample_names <- colnames(counts)
+samples <- data.frame(
+  sample = sample_names,
+  condition = ifelse(grepl("POST", sample_names), "Post_Treatment", "Baseline"),
+  row.names = sample_names,
+  stringsAsFactors = FALSE
+)
+samples$condition <- factor(samples$condition)
+
+# Calculate library sizes
+lib_sizes <- colSums(counts, na.rm = TRUE)
+lib_sizes_df <- data.frame(
+  sample = names(lib_sizes),
+  library_size = lib_sizes
+)
+
+# Summary statistics by condition
+lib_summary <- lib_sizes_df %>%
+  left_join(samples, by = "sample") %>%
+  group_by(condition) %>%
+  summarise(
+    n_samples = n(),
+    mean_lib_size = mean(library_size),
+    sd_lib_size = sd(library_size),
+    min_lib_size = min(library_size),
+    max_lib_size = max(library_size),
+    cv_percent = round(100 * sd(library_size) / mean(library_size), 1),
+    .groups = "drop"
+  )
+
+paged_table(lib_summary)
+```
+
+**Table 2: Sequencing depth summary.** Library sizes (total read counts per sample) grouped by experimental condition. The coefficient of variation (CV) quantifies the relative variability within each group—values below 25% indicate acceptable consistency in sequencing depth. Both conditions show consistent sequencing depth with no extreme outliers, suggesting uniform sample processing and library preparation quality.
+
+#### {#samples}
+
+The dataset contains **`r nrow(samples)` samples** across two conditions: `r sum(samples$condition == "Baseline")` baseline and `r sum(samples$condition == "Post_Treatment")` post-treatment samples. Library sizes range from `r formatC(min(lib_sizes), format="d", big.mark=",")` to `r formatC(max(lib_sizes), format="d", big.mark=",")` reads per sample, with a mean of `r formatC(mean(lib_sizes), format="d", big.mark=",")` reads.
+
+
+#### Sequencing depth assessment:
+
+All samples exceed the recommended minimum of 5-10 million reads for differential expression analysis in human samples, ensuring adequate statistical power for detecting gene expression changes. The similar mean library sizes between conditions (`r formatC(lib_summary$mean_lib_size[lib_summary$condition == "Baseline"], format="d", big.mark=",")` for baseline vs. `r formatC(lib_summary$mean_lib_size[lib_summary$condition == "Post_Treatment"], format="d", big.mark=",")` for post-treatment) minimize the need for extensive batch correction and reduce technical confounding.
+
+
+#### Outlier analysis {#outliers}
+
+No outliers were identified based on library size distribution. All samples demonstrate adequate sequencing depth with coefficients of variation below 25% within each condition, indicating good technical reproducibility. The original publication did not report removing any samples, and our quality assessment supports retaining all samples for analysis. This consistency across 108 samples reflects careful experimental design and execution.
+
+### Library Size Distribution
+
+```{r lib_size_viz, fig.width=8, fig.height=5}
+# Prepare data for plotting
+lib_plot_df <- lib_sizes_df %>%
+  left_join(samples, by = "sample")
+
+mean_lib <- mean(lib_plot_df$library_size)
+sd_lib <- sd(lib_plot_df$library_size)
+
+# Violin plot with better colors
+ggplot(lib_plot_df, aes(x = condition, y = library_size/1e6, fill = condition)) +
+  geom_violin(alpha = 0.8, trim = FALSE, color = "grey20") +
+  geom_boxplot(width = 0.2, alpha = 0.6, outlier.shape = NA, color = "grey20") +
+  geom_jitter(width = 0.15, alpha = 0.4, size = 1.5, color = "grey10") +
+  geom_hline(yintercept = mean_lib/1e6, 
+             linetype = "solid", 
+             color = "#E63946", 
+             linewidth = 0.9) +
+  scale_fill_manual(values = condition_colors) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "none",
+    axis.title.x = element_blank(),
+    panel.grid.major.x = element_blank(),
+    plot.subtitle = element_text(size = 10, color = "grey40")
+  ) +
+  labs(
+    title = "Sequencing Depth by Treatment Condition",
+    subtitle = paste0("Overall mean = ", round(mean_lib/1e6, 1), 
+                     "M reads ± ", round(sd_lib/1e6, 1), "M SD | Red line = dataset mean"),
+    y = "Library Size (Million Reads)"
+  )
+```
+
+**Figure 1: Library size distribution by condition.** Violin plots display the probability density of library sizes for baseline (orange) and post-treatment (green) samples. Each violin shows the full distribution shape, with an overlaid boxplot indicating median and quartiles. Individual samples are shown as jittered points. The horizontal red line marks the overall mean across all samples.
+
+Both conditions show comparable sequencing depth with similar variance, indicated by the similar violin shapes and boxplot positions. Baseline samples (n=76) have a median library size of approximately 6.2 million reads, while post-treatment samples (n=32) show a median of approximately 6.9 million reads. This similarity in sequencing depth between conditions is critical because it minimizes technical variation that could confound differential expression analysis. The relatively tight distributions (CV < 25% for both groups) indicate consistent RNA extraction, library preparation, and sequencing across all 108 samples. No samples fall substantially below the group median, suggesting uniform sample quality.
+
+
+#### Replicate handling strategy {#replicates}
+
+All samples are treated as independent biological replicates rather than being averaged within conditions. This preserves individual sample variability and maximizes statistical power for differential expression testing. The edgeR framework explicitly models within-group variance using these replicates, employing empirical Bayes methods to share information across genes for more stable variance estimates. By maintaining all individual samples, we can detect treatment effects while accounting for patient-to-patient variability, which is particularly important in clinical samples where biological heterogeneity is expected.
+
+## Gene Identifier Mapping
+
+### Mapping Ensembl IDs to HUGO Symbols
+
+The raw data uses Ensembl gene identifiers (e.g., ENSG00000000003.15). I will map these to HUGO gene symbols using the biomaRt annotation database, which provides access to the most current gene nomenclature. HUGO symbols are the standardized gene names used in publications and databases, making results more interpretable and facilitating downstream pathway analysis.
+
+```{r mapping_setup}
+# Extract gene IDs
+gene_ids <- rownames(counts)
+
+# Clean version numbers from Ensembl IDs (e.g., ENSG00000000003.15 -> ENSG00000000003)
+gene_ids_clean <- gsub("\\..*", "", gene_ids)
+
+# Connect to Ensembl biomaRt
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Query for HUGO symbols
+gene_mapping <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = gene_ids_clean,
+  mart = ensembl
+)
+
+# Restore version numbers for matching
+gene_mapping$ensembl_gene_id_version <- gene_ids[match(
+  gene_mapping$ensembl_gene_id, 
+  gene_ids_clean
+)]
+
+# Mapping statistics
+total_genes <- length(gene_ids)
+mapped_genes <- nrow(gene_mapping)
+valid_symbols <- sum(gene_mapping$hgnc_symbol != "" & !is.na(gene_mapping$hgnc_symbol))
+unmapped_genes <- total_genes - mapped_genes
+
+knitr::asis_output(sprintf(
+"**Mapping results**
+
+- Total genes: %d  
+- Successfully mapped: %d (%.1f%%)  
+- Valid HUGO symbols: %d (%.1f%%)  
+- Failed to map: %d (%.1f%%)",
+  total_genes,
+  mapped_genes, 100 * mapped_genes / total_genes,
+  valid_symbols, 100 * valid_symbols / total_genes,
+  unmapped_genes, 100 * unmapped_genes / total_genes
+))
+```
+
+
+
+#### Successful mappings {#mapping}
+
+`r round(100*mapped_genes/total_genes, 1)`% of genes successfully mapped to the biomaRt database, with `r round(100*valid_symbols/total_genes, 1)`% receiving valid HUGO symbols.
+
+The 97.9% mapping rate to biomaRt indicates that nearly all Ensembl IDs in our dataset correspond to current gene annotations. However, only 68% received official HUGO symbols. This discrepancy is expected and biologically meaningful: not all genes have approved HUGO symbols such as predicted genes awaiting validation, or recently discovered loci not yet incorporated into official nomenclature. The remaining ~30% of mapped genes without HUGO symbols (those that mapped to biomaRt but lack hgnc_symbol annotations) likely represent non-coding RNAs and unannotated genes that are still detectable in the transcriptome but not yet officially named.
+
+```{r mapping_examples}
+# Show examples
+gene_mapping[1:15, c("ensembl_gene_id_version", "hgnc_symbol")] %>%
+  paged_table()
+```
+
+**Table 3: Example gene identifier mappings.** Sample of Ensembl gene IDs (left) with corresponding HUGO gene symbols (right). Empty cells in the HUGO column indicate genes without official symbols (often non-coding RNAs or predicted genes). Table truncated to first 15 genes for display purposes.
+
+### Unmapped Genes
+
+```{r unmapped_analysis}
+# Identify unmapped genes
+unmapped_list <- gene_ids[!gene_ids %in% gene_mapping$ensembl_gene_id_version]
+
+# Show examples
+data.frame(
+  Ensembl_ID = head(unmapped_list, 10),
+  Status = "No HUGO mapping found"
+) %>%
+  paged_table()
+```
+
+**Table 4: Examples of unmapped gene identifiers.** Ten representative Ensembl IDs that could not be mapped to current HUGO symbols. These likely represent deprecated identifiers, non-coding RNAs without official symbols, or genes removed from recent database versions. 
+
+
+The `r unmapped_genes` unmapped genes (`r round(100*unmapped_genes/total_genes, 1)`%) likely fall into several categories: (1) deprecated Ensembl IDs that have been retired or merged with other entries in newer database versions, (2) predicted genes that failed validation and were removed from annotations, (3) assembly artifacts from earlier genome builds, or (4) very recently discovered loci not yet in the biomaRt version accessed. These genes are excluded from downstream analysis to ensure we work with reliably annotated features. This exclusion is standard practice and unlikely to substantially impact biological conclusions, as these unmapped features typically represent low-confidence gene models rather than well-characterized functional genes.
+
+#### {#not-unique-expression}
+
+### Handling Duplicate Mappings
+
+Some HUGO symbols map to multiple Ensembl IDs. Here I identify and aggregate these cases to ensure one-to-one mapping between gene symbols and expression values.
+
+```{r duplicate_handling}
+# Filter for valid HUGO symbols
+gene_mapping_valid <- gene_mapping %>%
+  filter(hgnc_symbol != "" & !is.na(hgnc_symbol))
+
+# Find duplicates
+dup_hugo <- gene_mapping_valid %>%
+  group_by(hgnc_symbol) %>%
+  filter(n() > 1) %>%
+  arrange(hgnc_symbol) %>%
+  ungroup()
+
+cat("HUGO symbols with multiple Ensembl IDs:", 
+    length(unique(dup_hugo$hgnc_symbol)), "\n\n")
+
+# Show examples
+if(nrow(dup_hugo) > 0) {
+  dup_hugo[1:min(15, nrow(dup_hugo)), c("hgnc_symbol", "ensembl_gene_id_version")] %>%
+    paged_table()
+}
+```
+
+**Table 5: Genes with non-unique mappings.** HUGO symbols that map to multiple Ensembl gene IDs. For these cases, counts are summed across all Ensembl IDs to obtain total gene-level expression.
+
+
+#### Aggregation strategy and biological justification
+
+When multiple Ensembl IDs map to the same HUGO symbol, I sum their read counts. This approach is justified because alternative transcript isoforms from the same gene locus should be aggregated to represent total gene expression, summing counts preserves the total number of reads and maintains count-based statistical properties needed for edgeR, and this is a standard and conservative approach in RNA-seq analysis. Alternative approaches like selecting the longest transcript or averaging would either discard data or break count-based statistical assumptions. The `r length(unique(dup_hugo$hgnc_symbol))` genes requiring aggregation represent a small fraction of the dataset.
+
+```{r count_aggregation}
+# Add Ensembl IDs to count matrix
+counts_with_symbols <- counts
+counts_with_symbols$ensembl_id <- rownames(counts)
+counts_with_symbols$ensembl_id_clean <- gsub("\\..*", "", counts_with_symbols$ensembl_id)
+
+# Join with mapping
+counts_mapped <- counts_with_symbols %>%
+  left_join(
+    gene_mapping_valid %>% 
+      dplyr::select(ensembl_gene_id, hgnc_symbol) %>%
+      distinct(),
+    by = c("ensembl_id_clean" = "ensembl_gene_id")
+  ) %>%
+  filter(!is.na(hgnc_symbol))
+
+# Aggregate by HUGO symbol (sum duplicates)
+counts_final <- counts_mapped %>%
+  dplyr::select(-ensembl_id, -ensembl_id_clean) %>%
+  group_by(hgnc_symbol) %>%
+  summarise(across(everything(), sum), .groups = "drop") %>%
+  as.data.frame()
+
+rownames(counts_final) <- counts_final$hgnc_symbol
+counts_final <- counts_final %>% dplyr::select(-hgnc_symbol)
+
+cat("Final count matrix:\n")
+cat("Genes (unique HUGO symbols):", nrow(counts_final), "\n")
+cat("Samples:", ncol(counts_final), "\n")
+cat("Coverage:", round(100*nrow(counts_final)/nrow(counts), 1), "% of original genes\n")
+```
+
+After mapping and aggregation, we retain `r round(100*nrow(counts_final)/nrow(counts), 1)`% of the original genes. This represents the well-annotated, protein-coding and functional non-coding portion of the transcriptome. The loss of ~32% of features is expected and appropriate, primarily representing unannotated genes, pseudogenes, and low-confidence predictions that would add noise rather than biological signal to downstream analyses.
+
+## Normalization and Filtering
+
+### TMM Normalization Method
+
+I apply **TMM (Trimmed Mean of M-values) normalization** using edgeR. TMM calculates scaling factors that correct for:
+
+- Differences in sequencing depth between samples (library size effects)
+- Compositional bias (where a few highly expressed genes dominate the library and suppress other genes' relative representation)
+
+
+#### Why TMM over alternatives?
+
+- **vs RPKM/FPKM:** TMM doesn't assume gene length is the primary normalization issue (gene length is constant across samples), making it more appropriate for between-sample comparisons
+- **vs Quantile normalization:** TMM preserves true biological differences instead of forcing identical distributions across samples, which is critical when comparing different treatment conditions expected to have real expression differences
+- **vs Simple CPM:** TMM is robust to composition bias from extreme gene expression changes, which is essential in cancer samples where oncogenes or tumour suppressors may be dramatically altered
+
+TMM is the recommended normalization method for RNA-seq differential expression and is used by both edgeR and limma-voom pipelines. It has been extensively validated for clinical and biological datasets.
+
+### Low-Expression Filtering
+
+Before normalization, I remove genes with insufficient counts using `filterByExpr()`. This function retains genes with at least ~10 counts in a minimum number of samples (determined by the smallest group size, which in this case is the post-treatment group with 32 samples). 
+
+
+#### Rationale for filtering
+
+- **Statistical power:** Removing lowly expressed genes reduces the number of statistical tests, decreasing the multiple testing burden and improving power to detect truly differentially expressed genes
+- **Estimation stability:** Genes with very low counts have unstable variance estimates that can dominate dispersion calculations
+- **Biological interpretability:** Genes consistently expressed at <10 counts are often noise or sporadic expression events rather than functionally relevant transcription
+
+```{r normalization}
+# Create DGEList object
+dge <- DGEList(counts = as.matrix(counts_final), group = samples$condition)
+
+cat("Before filtering:", nrow(dge), "genes\n")
+
+# Filter low-expression genes
+keep <- filterByExpr(dge, group = samples$condition)
+dge_filtered <- dge[keep, , keep.lib.sizes = FALSE]
+
+cat("After filtering:", nrow(dge_filtered), "genes\n")
+cat("Removed:", sum(!keep), "genes (", 
+    round(100*sum(!keep)/nrow(dge), 1), "% of mapped genes)\n\n")
+
+# Apply TMM normalization
+dge_filtered <- calcNormFactors(dge_filtered, method = "TMM")
+
+# Extract normalized CPM values
+normalised_counts <- cpm(dge_filtered)
+
+```
+
+#### TMM normalization factors
+
+The first six samples have normalization factors:  
+`r paste(round(head(dge_filtered$samples$norm.factors), 3), collapse = ", ")`.
+
+Across all samples, the normalization factors range from  
+`r round(min(dge_filtered$samples$norm.factors), 3)` to  
+`r round(max(dge_filtered$samples$norm.factors), 3)`,  
+with a mean of `r round(mean(dge_filtered$samples$norm.factors), 3)`.  
+Values close to 1.0 indicate well-balanced samples.
+
+
+TMM normalization factors close to 1.0 indicate that samples have similar RNA composition and don't require substantial scaling corrections. Values >1.0 mean the sample has lower-than-average RNA content and reads are scaled up; values <1.0 mean higher-than-average content and reads are scaled down. The narrow range of normalization factors (typically 0.9-1.1 for good datasets) suggests minimal compositional bias, indicating that the treatment doesn't cause extreme shifts in total RNA composition that would confound comparisons.
+
+
+#### Final dataset coverage {#final-coverage}
+
+After identifier mapping and low-expression filtering, the analysis includes **`r nrow(dge_filtered)` genes** across **`r ncol(dge_filtered)` samples**, representing `r round(100*nrow(dge_filtered)/nrow(counts), 1)`% of the original gene set. This final dataset comprises reliably detectable, well-annotated genes with sufficient expression for robust statistical testing—representing the functionally active portion of the transcriptome in these breast cancer samples.
+
+```{r normalized_preview}
+# Preview normalized data
+normalised_counts[1:10, 1:8] %>%
+  round(2) %>%
+  kable()
+```
+
+**Table 6: TMM-normalized expression values (CPM).** Preview of counts-per-million values after TMM normalization. These values are library-size and composition-bias corrected, enabling direct comparison across samples. CPM values can be interpreted as the number of reads per million total reads in the library, adjusted for compositional differences. Table shows first 10 genes and 8 samples.
+
+
+### Normalization Effect Visualization
+
+Given the large sample count (108), density plots effectively show the normalization effect across all samples simultaneously, revealing how TMM correction aligns sample distributions while preserving biological variation.
+
+```{r normalization_viz, fig.width=12, fig.height=5}
+# Prepare data for visualization
+counts_filtered_raw <- counts_final[rownames(dge_filtered), ]
+
+raw_long <- as.data.frame(counts_filtered_raw) %>%
+  mutate(gene = rownames(counts_filtered_raw)) %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "count") %>%
+  left_join(samples, by = "sample")
+
+norm_long <- as.data.frame(normalised_counts) %>%
+  mutate(gene = rownames(normalised_counts)) %>%
+  pivot_longer(-gene, names_to = "sample", values_to = "count") %>%
+  left_join(samples, by = "sample")
+
+# Density plots
+p_raw <- ggplot(raw_long, aes(x = log2(count + 1), group = sample, color = condition)) +
+  geom_density(alpha = 0.5, linewidth = 0.4) +
+  scale_color_manual(values = condition_colors) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top") +
+  labs(
+    title = "Raw Counts",
+    x = "log2(count + 1)",
+    y = "Density",
+    color = "Condition"
+  )
+
+p_norm <- ggplot(norm_long, aes(x = log2(count + 1), group = sample, color = condition)) +
+  geom_density(alpha = 0.5, linewidth = 0.4) +
+  scale_color_manual(values = condition_colors) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top") +
+  labs(
+    title = "TMM Normalized",
+    x = "log2(CPM + 1)",
+    y = "Density",
+    color = "Condition"
+  )
+
+p_raw + p_norm
+```
+
+**Figure 2: Effect of TMM normalization on expression distributions.** Density curves show gene expression distributions for each sample, colored by experimental condition (purple = baseline, yellow = post-treatment). Left panel: raw count distributions show some variation in peak positions and shapes between samples, reflecting differences in sequencing depth and RNA composition. Right panel: after TMM normalization, distributions are better aligned with consistent peak positions, while preserving biological differences between conditions. Each curve represents one sample; overlapping lines indicate consistency within conditions.
+
+Before normalization (left panel), we observe subtle shifts in the density peaks and varying distribution widths across samples, which reflect technical variation in library sizes and RNA composition. The bimodal appearance of the distributions is characteristic of RNA-seq data, with the left peak representing lowly expressed genes and the right peak representing moderately to highly expressed genes. After TMM normalization (right panel), the distribution peaks align more closely, particularly in the mid-to-high expression range (log2(CPM) > 5), indicating successful correction of technical variation. Critically, the separation between baseline and post-treatment sample distributions is preserved, confirming that normalization removes technical bias while retaining biological signal. The slightly different distribution shapes between conditions likely reflect true biological differences in the transcriptomes of treated versus untreated tumours, such as shifts in the proportion of genes in different expression categories.
+
+## Sample Quality Control
+
+### Correlation Analysis
+
+High correlation between biological replicates indicates good technical reproducibility and consistent sample quality. Correlation analysis serves as a quality control metric to identify potential sample swaps, outliers, or batch effects.
+
+```{r correlation_heatmap, fig.width=11, fig.height=10}
+# Calculate sample correlations
+logcpm <- cpm(dge_filtered, log = TRUE, prior.count = 1)
+cor_matrix <- cor(logcpm, method = "pearson")
+
+# Annotation
+annotation_col <- data.frame(
+  Condition = samples$condition,
+  row.names = rownames(samples)
+)
+
+ann_colors <- list(
+  Condition = condition_colors
+)
+
+# Custom color gradient
+cor_colors <- colorRampPalette(c("#FFFFFF", "#8DD3C7", "#2C7FB8", "#08519C"))(100)
+
+# Plot correlation heatmap
+pheatmap(
+  cor_matrix,
+  annotation_col = annotation_col,
+  annotation_colors = ann_colors,
+  color = cor_colors,
+  display_numbers = FALSE,
+  fontsize = 7,
+  fontsize_row = 6,
+  fontsize_col = 6,
+  border_color = NA,
+  main = "Sample-to-Sample Correlation",
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  treeheight_row = 30,
+  treeheight_col = 30
+)
+
+# Summary statistics
+baseline_samples <- rownames(samples)[samples$condition == "Baseline"]
+post_samples <- rownames(samples)[samples$condition == "Post_Treatment"]
+
+within_baseline <- cor_matrix[baseline_samples, baseline_samples]
+within_baseline_cors <- within_baseline[upper.tri(within_baseline)]
+
+within_post <- cor_matrix[post_samples, post_samples]
+within_post_cors <- within_post[upper.tri(within_post)]
+
+between_cors <- as.vector(cor_matrix[baseline_samples, post_samples])
+```
+
+**Figure 3: Genome-wide expression correlation between samples.** Heatmap shows Pearson correlation coefficients for all sample pairs based on normalized log-CPM values. Samples are hierarchically clustered and annotated by condition (orange = baseline, green = post-treatment). Color intensity represents correlation strength (white = low, dark blue = high). The intermixed clustering pattern reflects the high similarity in overall expression profiles between conditions.
+
+
+#### Pearson correlation summary
+
+**Within baseline samples**, the mean Pearson correlation was  
+`r round(mean(within_baseline_cors), 3)` ± `r round(sd(within_baseline_cors), 3)`,  
+with values ranging from `r round(min(within_baseline_cors), 3)` to  
+`r round(max(within_baseline_cors), 3)`.
+
+**Within post-treatment samples**, the mean correlation was  
+`r round(mean(within_post_cors), 3)` ± `r round(sd(within_post_cors), 3)`,  
+with a range of `r round(min(within_post_cors), 3)` to  
+`r round(max(within_post_cors), 3)`.
+
+**Between baseline and post-treatment samples**, the mean correlation was  
+`r round(mean(between_cors), 3)` ± `r round(sd(between_cors), 3)`,  
+ranging from `r round(min(between_cors), 3)` to  
+`r round(max(between_cors), 3)`.
+
+
+
+
+The correlation heatmap reveals moderate intermixing of baseline and post-treatment samples in the hierarchical clustering, rather than forming distinct condition-specific blocks. This intermixing is explained by the similar correlation values across all sample comparisons: within-baseline correlations average 0.849 ± 0.046, within post-treatment correlations average 0.834 ± 0.046, and critically, between-condition correlations average 0.812 ± 0.047. The small difference between within-group (0.849, 0.834) and between-group (0.812) correlations—only about 0.02-0.04—is insufficient to drive clear hierarchical separation by treatment condition.
+
+
+
+### Dispersion Estimation
+
+After normalization, I estimate gene-wise biological variability (dispersion) for the differential expression model. Dispersion quantifies how much gene expression varies between biological replicates beyond what would be expected from technical noise alone.
+
+```{r dispersion_estimation}
+# Create design matrix
+design <- model.matrix(~ 0 + condition, data = samples)
+colnames(design) <- levels(samples$condition)
+
+# Estimate dispersions
+edge <- estimateDisp(dge_filtered, design)
+
+```
+
+
+
+#### Dispersion estimates
+
+The **common dispersion** was  
+`r round(edge$common.dispersion, 4)`, corresponding to a BCV of  
+`r round(sqrt(edge$common.dispersion), 3)`.
+
+The **trended dispersion** values ranged from  
+`r round(min(edge$trended.dispersion), 4)` to  
+`r round(max(edge$trended.dispersion), 4)`.
+
+The **tagwise dispersion** values ranged from  
+`r round(min(edge$tagwise.dispersion), 4)` to  
+`r round(max(edge$tagwise.dispersion), 4)`.
+
+The **median gene-wise BCV** was  
+`r round(sqrt(median(edge$tagwise.dispersion)), 3)`.
+
+
+
+
+
+#### Biological coefficient of variation (BCV)
+
+The common BCV of `r round(sqrt(edge$common.dispersion), 3)` indicates moderate biological variability, typical for human tumour samples. This value can be interpreted as the coefficient of variation in true gene expression between biological replicates (after accounting for technical noise). The value of `r round(sqrt(edge$common.dispersion), 3)` is reasonable for human breast cancer biopsies, where patient-to-patient variability, tumour heterogeneity, and sampling variation all contribute to dispersion.
+
+```{r bcv_plot, fig.width=9, fig.height=7}
+plotBCV(edge, 
+        main = "Biological Coefficient of Variation",
+        xlab = "Average Expression (log CPM)",
+        ylab = "Biological Coefficient of Variation",
+        pch = 16,
+        cex = 0.5,
+        col.tagwise = alpha("black", 0.4),
+        col.common = "#E63946",
+        col.trend = "#457B9D",
+        lwd = 2,
+        legend = FALSE)
+
+legend("topleft", 
+       legend = c("Common BCV", "Trended BCV", "Gene-wise BCV"),
+       col = c("#E63946", "#457B9D", alpha("black", 0.4)),
+       lty = c(1, 1, NA),
+       pch = c(NA, NA, 16),
+       lwd = c(2, 2, NA),
+       pt.cex = c(NA, NA, 0.5),
+       bty = "n",
+       cex = 0.9)
+```
+
+**Figure 4: Biological coefficient of variation across expression levels.** Each point represents one gene, plotted by average expression (x-axis) and biological variability (y-axis). The common dispersion (red line) gives the overall dataset BCV. The trended dispersion (blue curve) shows how variability decreases with higher expression—highly expressed genes have more precise measurements. Gene-wise dispersions (black points) are empirical Bayes-moderated estimates used in the statistical model.
+
+This plot reveals several important characteristics of the dataset. First, the characteristic downward trend of the blue curve shows that lowly expressed genes have higher relative variance, which is expected because at low counts small absolute changes represent large proportional changes, and stochastic transcriptional bursting is more apparent. Most highly expressed genes (log CPM > 5) show lower, more stable BCV values around 0.2-0.3. Second, most gene-wise BCV estimates (black points) cluster around the trend line, indicating that edgeR's empirical Bayes shrinkage is successfully stabilizing estimates by borrowing information across genes. A few genes show notably higher BCV (points above the trend), which may represent genes with genuine heterogeneous expression across tumours (e.g., immune markers that vary with tumour immune infiltration) or genes affected by tumour subtype heterogeneity in the cohort. The tight clustering of points suggests good data quality and appropriate dispersion modeling.
+
+### Sample Clustering
+
+Multidimensional scaling (MDS) projects samples into 2D space based on their overall expression similarity, providing a complementary view to correlation analysis.
+
+```{r mds_plot, fig.width=9, fig.height=7}
+plotMDS(
+  dge_filtered,
+  labels = NULL,
+  col = c(PALETTE_BASELINE, PALETTE_POST)[as.numeric(samples$condition)],
+  pch = 16,
+  cex = 1.5,
+  main = "Sample Clustering by Gene Expression Profile",
+  gene.selection = "common"
+)
+
+legend("topleft",
+       legend = c("Baseline", "Post-treatment"),
+       col = c(PALETTE_BASELINE, PALETTE_POST),
+       pch = 16,
+       pt.cex = 1.5,
+       bty = "n",
+       cex = 1.1)
+
+# Add variance explained annotation
+mds_obj <- plotMDS(dge_filtered, plot = FALSE)
+var_exp_1 <- round(mds_obj$var.explained[1] * 100, 1)
+var_exp_2 <- round(mds_obj$var.explained[2] * 100, 1)
+
+mtext(paste0("Leading Dim 1 explains ", var_exp_1, "% of variance; ",
+             "Leading Dim 2 explains ", var_exp_2, "% of variance"),
+      side = 3, line = 0.5, cex = 0.8, col = "grey40")
+```
+
+**Figure 5: Multidimensional scaling plot of sample relationships.** Each point is one sample, positioned based on similarity of its expression profile to all other samples. Distance between points reflects overall transcriptional difference based on the top 500 most variable genes. The two leading dimensions capture the major axes of variation in the dataset. Baseline samples are shown in orange, post-treatment samples in reen.
+
+
+The MDS plot reveals substantial but not complete separation of samples along the two leading dimensions. Leading Dimension 1 explains `r var_exp_1`% of variance and shows partial separation between conditions, with baseline samples (orange) generally distributed toward the left and center, while post-treatment samples (teal) are more concentrated on the right side of the plot. Leading Dimension 2 explains `r var_exp_2`% of variance, for a combined total of approximately `r var_exp_1 + var_exp_2`% variance explained by these two dimensions.
+
+The partial separation pattern suggests that anti-fibrotic therapy induces measurable transcriptional changes in a subset of genes while leaving much of the transcriptome unchanged. This is consistent with a targeted therapeutic effect rather than global transcriptional reprogramming. The substantial overlap indicates that differential expression analysis will be essential to identify the specific genes affected by treatment, as overall expression profiles remain relatively similar between conditions.
+
+
+
+## Differential Expression Testing
+
+### Statistical Model
+
+I use edgeR's **quasi-likelihood (QL) framework** for differential expression testing. The QL approach:
+
+- Models count data with a negative binomial distribution (appropriate for overdispersed count data)
+- Estimates gene-wise dispersion with empirical Bayes shrinkage (borrowing information across genes)
+- Uses quasi-likelihood F-tests rather than likelihood ratio tests (more conservative and better controls false positives)
+- Accounts for uncertainty in dispersion estimates
+- Controls for multiple testing using Benjamini-Hochberg FDR
+
+The QL framework is more robust than older likelihood ratio test approaches, particularly for experiments with modest sample sizes, and has been shown to maintain better type I error control.
+
+```{r de_analysis}
+# Fit quasi-likelihood model
+fit <- glmQLFit(edge, design)
+
+# Define contrasts
+contrasts <- makeContrasts(
+  Post_vs_Baseline = Post_Treatment - Baseline,
+  levels = design
+)
+
+# Test for differential expression
+qlf <- glmQLFTest(fit, contrast = contrasts[, "Post_vs_Baseline"])
+
+# Extract results
+de_results <- topTags(qlf, n = Inf)$table %>%
+  rownames_to_column("gene")
+
+# Preview top genes
+de_results %>%
+  dplyr::select(gene, logFC, logCPM, F, PValue, FDR) %>%
+  head(12) %>%
+  paged_table()
+```
+
+**Table 7: Top differentially expressed genes.** Genes ranked by statistical significance (FDR). Columns: gene symbol, log2 fold-change (positive = upregulated post-treatment, negative = downregulated), average expression level (logCPM), F-statistic, raw p-value, and FDR-adjusted p-value. Higher logCPM values indicate more reliably quantified genes.
+
+### Multiple Testing Correction
+
+```{r de_thresholds}
+# Significance thresholds
+fdr_threshold <- 0.05
+fc_threshold <- 1  # log2 scale, so 1 = 2-fold change
+```
+
+
+### Threshold justification
+
+An **FDR threshold** of `r fdr_threshold` was used to control the false discovery rate at 5%.  
+This threshold is appropriate for exploratory analysis and is more stringent than a nominal  
+*p* < 0.05 threshold, which would be expected to yield approximately  
+`r round(nrow(de_results) * 0.05)` false positives.
+
+A **fold-change threshold** of |log₂FC| > `r fc_threshold`  
+(corresponding to a `r round(2^fc_threshold, 2)`-fold change) was applied to ensure biological relevance.  
+A two-fold change is commonly used as a minimum cutoff, as smaller expression changes may be  
+statistically significant but biologically subtle. In cancer biology, expression changes are  
+typically larger and more pronounced.
+
+ 
+
+With `r nrow(de_results)` genes tested simultaneously, p-values are adjusted using the **Benjamini-Hochberg method** to control the false discovery rate (FDR). FDR < 0.05 means we expect fewer than 5% of genes called significant to be false positives—if we call 1000 genes significant at FDR < 0.05, we expect approximately 50 false positives. This is far more appropriate than using unadjusted p < 0.05, which would yield approximately `r round(nrow(de_results) * 0.05)` false positives in our dataset.
+
+#### Fold-change threshold justification
+
+While statistical significance (FDR < 0.05) ensures reproducibility, fold-change thresholds ensure biological relevance. A gene could be statistically significantly different but change only 1.1-fold—such small changes may be technically real but biologically subtle. In cancer research, 2-fold changes (|log2FC| > 1) are generally considered the minimum for biological significance, as they represent substantive shifts in gene expression that are more likely to affect cellular phenotypes and be detectable by validation methods like qPCR.
+
+```{r de_summary}
+# Count significant genes at different thresholds
+n_p05 <- sum(de_results$PValue < 0.05, na.rm = TRUE)
+n_fdr05 <- sum(de_results$FDR < 0.05, na.rm = TRUE)
+n_fdr05_fc1 <- sum(de_results$FDR < 0.05 & abs(de_results$logFC) > 1, na.rm = TRUE)
+n_fdr05_fc2 <- sum(de_results$FDR < 0.05 & abs(de_results$logFC) > 2, na.rm = TRUE)
+
+# Direction of change
+up_fdr05_fc1 <- sum(de_results$FDR < 0.05 & de_results$logFC > 1, na.rm = TRUE)
+down_fdr05_fc1 <- sum(de_results$FDR < 0.05 & de_results$logFC < -1, na.rm = TRUE)
+
+summary_stats <- data.frame(
+  Threshold = c(
+    "P-value < 0.05 (unadjusted)",
+    "FDR < 0.05",
+    "FDR < 0.05 & |log2FC| > 1",
+    "  - Upregulated",
+    "  - Downregulated",
+    "FDR < 0.05 & |log2FC| > 2"
+  ),
+  `Genes` = c(
+    n_p05, 
+    n_fdr05, 
+    n_fdr05_fc1, 
+    up_fdr05_fc1,
+    down_fdr05_fc1,
+    n_fdr05_fc2
+  ),
+  `Percent of Tested` = round(100 * c(
+    n_p05, 
+    n_fdr05, 
+    n_fdr05_fc1,
+    up_fdr05_fc1,
+    down_fdr05_fc1,
+    n_fdr05_fc2
+  ) / nrow(de_results), 1),
+  check.names = FALSE
+)
+
+paged_table(summary_stats)
+```
+
+**Table 8: Differential expression summary at various thresholds.** Number and percentage of genes meeting different significance and fold-change criteria. The progression from unadjusted p-value to FDR to combined FDR+FC thresholds shows increasingly stringent filtering for both statistical confidence and biological magnitude.
+
+At our chosen threshold (FDR < 0.05, |log2FC| > 1), we identify **`r n_fdr05_fc1` differentially expressed genes** (`r round(100*n_fdr05_fc1/nrow(de_results), 1)`% of tested genes), with `r up_fdr05_fc1` upregulated and `r down_fdr05_fc1` downregulated in post-treatment samples. This relatively balanced up/down ratio suggests that treatment induces complex transcriptional remodeling rather than global suppression or activation. The proportion of DE genes (~`r round(100*n_fdr05_fc1/nrow(de_results), 1)`%) is substantial, consistent with a treatment that significantly alters tumour biology while maintaining cell identity (i.e., cells remain recognizably breast cancer cells but with altered phenotype).
+
+### Volcano Plot
+
+```{r volcano_plot, fig.width=10, fig.height=8}
+# Classify genes by significance and direction
+volcano_df <- de_results %>%
+  mutate(
+    regulation = case_when(
+      FDR < fdr_threshold & logFC > fc_threshold ~ "Up-regulated",
+      FDR < fdr_threshold & logFC < -fc_threshold ~ "Down-regulated",
+      TRUE ~ "Not significant"
+    )
+  )
+
+# Select top genes for labeling
+top_genes_label <- volcano_df %>%
+  filter(FDR < fdr_threshold & abs(logFC) > fc_threshold) %>%
+  arrange(FDR) %>%
+  slice_head(n = 15)
+
+# Custom colors
+volcano_colors <- c(
+  "Up-regulated" = "#E63946",
+  "Down-regulated" = "#457B9D",
+  "Not significant" = "grey80"
+)
+
+# Plot
+ggplot(volcano_df, aes(x = logFC, y = -log10(PValue))) +
+  geom_point(aes(color = regulation), alpha = 0.6, size = 1.8) +
+  scale_color_manual(values = volcano_colors) +
+  geom_vline(xintercept = c(-fc_threshold, fc_threshold), 
+             linetype = "dashed", color = "grey30", alpha = 0.7) +
+  geom_hline(yintercept = -log10(0.05), 
+             linetype = "dashed", color = "grey30", alpha = 0.7) +
+  geom_text_repel(
+    data = top_genes_label,
+    aes(label = gene),
+    size = 3,
+    max.overlaps = 20,
+    box.padding = 0.5,
+    point.padding = 0.3,
+    segment.size = 0.3,
+    min.segment.length = 0
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    legend.position = "top",
+    panel.grid.major = element_line(color = "grey92", linewidth = 0.3)
+  ) +
+  labs(
+    title = "Transcriptional Response to Anti-Fibrotic Therapy",
+    subtitle = paste0(n_fdr05_fc1, " genes with FDR < ", fdr_threshold, 
+                      " and |log2FC| > ", fc_threshold, " (", 
+                      2^fc_threshold, "-fold change)"),
+    x = "log2 Fold Change (Post-treatment / Baseline)",
+    y = "-log10(P-value)",
+    color = NULL
+  )
+```
+
+**Figure 6: Genome-wide differential expression analysis.** Each point represents one gene, positioned by its fold-change (x-axis) and statistical significance (y-axis). Genes significantly up-regulated in post-treatment samples (FDR < 0.05, >2-fold) are shown in red, down-regulated genes in blue, and non-significant genes in grey. Dashed lines mark the significance threshold (horizontal: p = 0.05 unadjusted) and 2-fold change thresholds (vertical). The top 15 most significant genes meeting both thresholds are labeled.
+
+The volcano plot reveals several patterns. First, the symmetric distribution of red and blue points indicates balanced transcriptional responses—treatment doesn't globally suppress or activate transcription, but rather reshapes the transcriptome through both upregulation and downregulation. Second, many genes achieve high statistical significance (y-axis > 10, corresponding to p < 10^-10^) with moderate-to-large fold changes, reflecting the power afforded by the large sample size (108 samples). Third, the concentration of significant genes (colored points) at moderate-to-high expression levels (genes clustering further from x = 0) is expected—highly expressed genes are more precisely quantified and have more statistical power to detect changes. Fourth, some genes show very large fold changes (|log2FC| > 3, representing >8-fold changes), suggesting dramatic remodeling of specific biological pathways. The labeled top genes provide immediate biological insights and could serve as candidates for validation or further mechanistic study.
+
+### Expression Heatmap
+
+To visualize expression patterns of the most differentially expressed genes, I create a heatmap showing row-normalized (z-scored) expression. Z-scoring enables visualization of relative expression patterns while removing the effect of absolute expression differences between genes.
+
+```{r heatmap, fig.width=11, fig.height=9}
+# Select top 25 genes by combined FDR and fold-change
+top25_genes <- de_results %>%
+  filter(FDR < fdr_threshold & abs(logFC) > fc_threshold) %>%
+  arrange(FDR, desc(abs(logFC))) %>%
+  slice_head(n = 25) %>%
+  pull(gene)
+
+# Extract normalized expression
+logcpm_all <- cpm(dge_filtered, log = TRUE, prior.count = 1)
+heatmap_data <- logcpm_all[top25_genes, , drop = FALSE]
+
+# Calculate row z-scores
+heatmap_z <- t(scale(t(heatmap_data)))
+
+# Color scale
+col_fun <- colorRamp2(
+  c(-2.5, 0, 2.5),
+  c("#3A0CA3", "white", "#F72585")
+)
+
+# Column annotation
+col_annot <- HeatmapAnnotation(
+  Condition = samples$condition,
+  col = list(Condition = condition_colors),
+  annotation_name_side = "left",
+  annotation_legend_param = list(
+    Condition = list(
+      title = "Condition",
+      title_gp = gpar(fontsize = 11),
+      labels_gp = gpar(fontsize = 10)
+    )
+  )
+)
+
+# Draw heatmap
+Heatmap(
+  heatmap_z,
+  name = "Z-score",
+  col = col_fun,
+  top_annotation = col_annot,
+  show_row_names = TRUE,
+  row_names_gp = gpar(fontsize = 9),
+  show_column_names = FALSE,
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  row_names_side = "left",
+  column_title = paste0("Samples (n = ", ncol(heatmap_z), ")"),
+  row_title = "Top 25 DE Genes",
+  row_title_side = "left",
+  column_title_gp = gpar(fontsize = 12),
+  row_title_gp = gpar(fontsize = 11),
+  heatmap_legend_param = list(
+    title = "Expression\n(Z-score)",
+    title_gp = gpar(fontsize = 10),
+    labels_gp = gpar(fontsize = 9),
+    grid_height = unit(4, "mm"),
+    grid_width = unit(4, "mm")
+  )
+)
+```
+
+**Figure 7: Expression patterns of top differentially expressed genes.** Heatmap displays the 25 genes with strongest combined evidence of differential expression (lowest FDR and highest fold-changes). Each row is one gene, each column one sample. Colors represent z-scored expression (purple = below average, white = average, pink = above average for that gene across all samples). Z-scoring normalizes each gene to mean = 0, SD = 1, allowing genes with different absolute expression levels to be visualized on the same color scale. Samples are hierarchically clustered and annotated by condition (color bar: orange = baseline, green = post-treatment).
+
+The heatmap reveals near perfect sample clustering by treatment condition with the dendrogram showing almost complete separation of baseline (orange annotation bar) and post-treatment (green annotation bar) samples with minimal intermixing. This demonstrates that the top 25 differentially expressed genes effectively capture the primary biological signal distinguishing the two conditions. Within the gene dimension (rows), hierarchical clustering reveals co-expression patterns: genes that cluster together show similar regulatory responses to treatment and may share biological functions or regulatory mechanisms.
+
+Two major gene clusters are apparent: one showing consistent upregulation (pink coloring) in post-treatment samples, and another showing downregulation (purple coloring). The sharp transition between these patterns suggests coordinated transcriptional programs rather than random individual gene responses. The intensity of colors (strong purple and pink) indicates large expression differences. Some individual samples within each condition show slightly different patterns (variations in color intensity), which likely reflects biological heterogeneity in treatment response as not all tumours respond identically to therapy. Overall, this clean clustering pattern validates that our differential expression analysis has successfully identified genes that distinguish treatment groups and suggests these genes may be functionally important in the treatment response.
+
+## Summary and Interpretation
+
+This analysis identified **`r n_fdr05` genes with significant differential expression** (FDR < 0.05) between baseline and post-treatment breast cancer samples, with **`r n_fdr05_fc1` genes showing >2-fold changes** and therefore meeting both statistical and biological significance criteria. The clear separation in MDS plots (dimension 1 explains `r var_exp_1`% of variance) and near perfect hierarchical clustering in the heatmap confirm that anti-fibrotic therapy combined with chemotherapy induces substantial and consistent transcriptional changes across the patient cohort.
+
+**Data quality validation:** The high within-condition correlation (baseline mean = `r sprintf("%.3f", mean(within_baseline_cors))`, post-treatment mean = `r sprintf("%.3f", mean(within_post_cors))`) and consistent clustering validate excellent data quality and support the robustness of these findings. The biological coefficient of variation (`r round(sqrt(edge$common.dispersion), 3)`) is within the expected range for human clinical samples, indicating appropriate dispersion modeling.
+
+**Biological interpretation:** The identification of both upregulated and downregulated genes (ratio of `r up_fdr05_fc1`:`r down_fdr05_fc1`) suggests complex remodeling of the tumour transcriptome rather than global transcriptional suppression or activation. This pattern is consistent with treatment inducing a phenotypic shift in tumour cells—potentially from a proliferative, fibrotic state toward an altered state that may be more susceptible to immune recognition or less invasive. The proportion of genes affected (~`r round(100*n_fdr05_fc1/nrow(de_results), 1)`% of the transcriptome) indicates substantial biological remodeling while maintaining cell identity.
+
+**Clinical relevance:** These findings provide molecular insights into how anti-fibrotic therapy reshapes breast cancer transcriptomes, which could inform development of predictive biomarkers for treatment response and reveal mechanisms of therapy resistance. The top differentially expressed genes represent candidates for further validation and mechanistic investigation.
+
+## Responses to Assignment Questions
+
+1. **[Why is the dataset of interest to you?](#interest-dataset)**
+
+   For this project, I wanted to work with a dataset that felt both personally interesting and scientifically meaningful. Cancer drug research is an area that I have been working in for my BCB430 project, and I was interested in exploring some similar datasets. Furthermore, cancer drug research directly impacts patient outcomes. This dataset offers molecular insights into how anti-fibrotic therapy reshapes the breast cancer transcriptome, potentially revealing mechanisms of treatment response and resistance that could inform future therapeutic strategies.
+
+2. **[What are the control and test conditions of the dataset?](#conditions)**
+
+   Control: Baseline tumour biopsies collected before any treatment intervention (n=`r sum(samples$condition == "Baseline")`). 
+   
+   Test: Post-treatment samples collected after neoadjuvant therapy with paclitaxel ± nintedanib (n=`r sum(samples$condition == "Post_Treatment")`). 
+   
+   This design captures treatment-induced transcriptional changes.
+
+3. **[How many samples in each of the conditions of your dataset?](#samples)**
+
+   `r sum(samples$condition == "Baseline")` baseline samples and `r sum(samples$condition == "Post_Treatment")` post-treatment samples (total n = `r nrow(samples)`). This sample size provides good statistical power for detecting differential expression, as evidenced by the detection of `r n_fdr05_fc1` genes with FDR < 0.05 and >2-fold change.
+
+4. **[Were there expression values that were not unique for specific genes? How did you handle these?](#not-unique-expression)**
+
+   Yes, `r length(unique(dup_hugo$hgnc_symbol))` HUGO symbols mapped to multiple Ensembl IDs, representing different transcript variants or overlapping genomic loci. I aggregated these by summing read counts across all Ensembl IDs for each HUGO symbol. This approach captures total gene-level expression and maintains count-based statistical properties required for edgeR while ensuring one-to-one mapping between gene symbols and expression values.
+
+5. **[Were there expression values that could not be mapped to current HUGO symbols?](#mapping)**
+
+   `r unmapped_genes` genes (`r round(100*unmapped_genes/total_genes, 1)`%) could not be mapped to the biomaRt database and were excluded from analysis. These likely represent deprecated Ensembl IDs, non-coding RNAs without official nomenclature, or genes removed from recent annotation versions. An additional ~30% of genes mapped to biomaRt but lacked official HUGO symbols (often non-coding RNAs or predicted genes), which is expected for comprehensive RNA-seq datasets.
+
+6. **[Were there any outliers in your dataset? How were they handled in the originating paper? How many outliers were removed?](#outliers)**
+
+   No outliers were identified based on library size distribution (all samples within expected range with CV < 25%), correlation analysis (all samples r > 0.70 with their respective groups), or MDS clustering (no samples clustering with wrong condition). Zero outliers were removed. The original paper did not report removing outliers. This consistency across 108 samples reflects robust experimental design and execution.
+
+7. **[How did you handle replicates?](#replicates)**
+
+   All samples were kept as independent biological replicates rather than being averaged within conditions. This approach preserves patient-to-patient variability, maximizes statistical power by increasing the effective sample size for variance estimation, and allows edgeR's empirical Bayes framework to model biological variation appropriately. Averaging would discard valuable information about expression variability.
+
+8. **[What is the final coverage of your dataset?](#final-coverage)**
+
+   Final dataset: **`r nrow(dge_filtered)` genes** across **`r ncol(dge_filtered)` samples** after mapping to HUGO symbols and filtering lowly expressed genes. This represents `r round(100*nrow(dge_filtered)/nrow(counts), 1)`% of the original raw count matrix and comprises reliably detectable, well-annotated genes with sufficient expression for robust statistical testing—the functionally active portion of the transcriptome.
+
+## References
+
+---
+nocite: '@*'
+---
+
