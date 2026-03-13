@@ -1,0 +1,23 @@
+producer_class	xtools.gsea.GseaPreranked
+producer_timestamp	1773200293196
+param	rpt_label	GSEAPreranked_Post_vs_Baseline
+param	rnd_seed	timestamp
+param	set_min	15
+param	zip_report	false
+param	create_svgs	false
+param	scoring_scheme	weighted
+param	rnk	/Users/vic/Desktop/bcb420/A2/results/ranked_gene_list.rnk
+param	norm	meandiv
+param	out	/Users/vic/Desktop/bcb420/A2/results
+param	mode	Abs_max_of_probes
+param	include_only_symbols	true
+param	help	false
+param	set_max	200
+param	gmx	/Users/vic/Desktop/bcb420/A2/Human_GOBP_AllPathways_noPFOCR_no_GO_iea_September_01_2025_symbol.gmt
+param	make_sets	true
+param	plot_top_x	20
+param	gui	false
+param	nperm	1000
+param	collapse	No_Collapse
+
+file	/Users/vic/Desktop/bcb420/A2/results/GSEAPreranked_Post_vs_Baseline.GseaPreranked.1773200293196/index.html
