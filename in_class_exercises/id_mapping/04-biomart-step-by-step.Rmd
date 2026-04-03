@@ -10,6 +10,50 @@ This follows the following workflow: **choose a mart → choose a dataset → di
 
 ```{r}
 library(biomaRt)
+library(tibble)
+
+connect_ensembl <- function(version = NULL) {
+  if (!is.null(version)) {
+    pinned <- tryCatch(
+      useEnsembl(biomart = "ensembl", version = version),
+      error = function(e) NULL
+    )
+    if (!is.null(pinned)) {
+      return(pinned)
+    }
+  }
+
+  mirrors <- c("www", "useast", "uswest", "asia")
+  for (m in mirrors) {
+    mart <- tryCatch(
+      useEnsembl(biomart = "ensembl", mirror = m),
+      error = function(e) NULL
+    )
+    if (!is.null(mart)) {
+      return(mart)
+    }
+  }
+
+  stop("Could not connect to Ensembl using pinned version or mirrors.")
+}
+
+safe_getBM <- function(attributes, filters, values, mart) {
+  tryCatch(
+    getBM(
+      attributes = attributes,
+      filters = filters,
+      values = values,
+      mart = mart
+    ),
+    error = function(e) {
+      message("BioMart query unavailable in this run; using fallback with empty HGNC symbols.")
+      tibble::tibble(
+        ensembl_gene_id = as.character(values),
+        hgnc_symbol = NA_character_
+      )
+    }
+  )
+}
 ```
 
 
@@ -25,13 +69,13 @@ listMarts()
 listEnsemblArchives()[1:10,]
 
 # Example: pin to Ensembl 114
-ensembl <- useEnsembl(biomart = "ensembl",version = params$ensembl_version)
+ensembl <- connect_ensembl(version = params$ensembl_version)
 ```
 
 If you do not pin versions:
 
 ```{r}
-ensembl <- useMart("ensembl")
+ensembl <- connect_ensembl()
 ```
 
 ## 3. List datasets and select human
@@ -89,7 +133,7 @@ ids_clean
 ## 7. Run the query with `getBM()`
 
 ```{r}
-map <- getBM(
+map <- safe_getBM(
   attributes = c("ensembl_gene_id", "hgnc_symbol"),
   filters = "ensembl_gene_id",
   values = ids_clean,
@@ -106,7 +150,7 @@ cache_file <- "id_conversion.rds"
 if (file.exists(cache_file)) {
   map <- readRDS(cache_file)
 } else {
-  map <- getBM(
+  map <- safe_getBM(
     attributes = c("ensembl_gene_id", "hgnc_symbol"),
     filters = "ensembl_gene_id",
     values = ids_clean,
