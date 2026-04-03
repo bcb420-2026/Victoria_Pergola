@@ -80,7 +80,7 @@ ggplot(volcano_df, aes(x = logFC, y = -log10(PValue), color = sig)) +
 
 ```{r}
 glmfit_0_vs_1 <- edgeR::glmFit(edge, design)
-glmtest_0_vs_1 <- edgeR::glmLRT(fit, contrast = contr[, "status0vs1"])
+glmtest_0_vs_1 <- edgeR::glmLRT(glmfit_0_vs_1, contrast = contr[, "status0vs1"])
 
 edgeR::topTags(glmtest_0_vs_1)
 ```
@@ -91,7 +91,6 @@ edgeR::topTags(glmtest_0_vs_1)
 glm_tab_0_vs_1 <- edgeR::topTags(glmtest_0_vs_1, n = Inf)$table %>% rownames_to_column("ensembl")
 
 tab_glm <- glm_tab_0_vs_1 %>%
-  rownames_to_column("gene") %>%
   mutate(
     neglog10P = -log10(PValue),
     direction = case_when(
@@ -101,7 +100,7 @@ tab_glm <- glm_tab_0_vs_1 %>%
     )
   )
 
-ggplot(tab, aes(x = logFC, y = neglog10P)) +
+ggplot(tab_glm, aes(x = logFC, y = neglog10P)) +
   geom_point(aes(color = direction), alpha = 0.7, size = 1.2) +
   scale_color_manual(values = c(
     "Up" = "red",

@@ -12,7 +12,7 @@ library(DESeq2)
 
 count_mat <- dge_f$counts
 storage.mode(count_mat) <- "integer"
-stopifnot(all(colnames(count_mat) == meta$sample))
+stopifnot(all(colnames(count_mat) == meta$samples))
 
 dds <- DESeqDataSetFromMatrix(
   countData = count_mat,

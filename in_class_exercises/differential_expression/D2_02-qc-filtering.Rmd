@@ -62,7 +62,7 @@ dim(dge)
 dim(dge_f)
 
 #create a subset of the gene mappings
-counts_mapped_filtered <- counts_mapped[counts_mapped$ensembl_gene_id %in% rownames(dge_f$counts),] 
+counts_mapped_filtered <- mappings[mappings$ensembl_gene_id %in% rownames(dge_f$counts),] 
 ```
 
 ## TMM normalization

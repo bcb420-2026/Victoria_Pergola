@@ -86,24 +86,67 @@ kable_head <- function(x, n = 5, caption = NULL) {
   knitr::kable(utils::head(x, n), caption = caption)
 }
 
+connect_ensembl <- function() {
+  mirrors <- c("www", "useast", "uswest", "asia")
+  for (m in mirrors) {
+    mart <- tryCatch(
+      biomaRt::useEnsembl(
+        biomart = "genes",
+        dataset = "hsapiens_gene_ensembl",
+        mirror = m
+      ),
+      error = function(e) NULL
+    )
+    if (!is.null(mart)) return(mart)
+  }
+  NULL
+}
+
+safe_map_to_hgnc <- function(ids, cache_key) {
+  cleaned <- unique(strip_ensembl_version(ids))
+  cleaned <- cleaned[grepl("^ENSG", cleaned)]
+
+  dir.create("cache", showWarnings = FALSE)
+  cache_file <- file.path("cache", paste0("hgnc_map_", cache_key, ".rds"))
+
+  mart <- connect_ensembl()
+  if (!is.null(mart)) {
+    live_map <- tryCatch(
+      biomaRt::getBM(
+        attributes = c("ensembl_gene_id", "hgnc_symbol"),
+        filters = "ensembl_gene_id",
+        values = cleaned,
+        mart = mart
+      ),
+      error = function(e) NULL
+    )
+
+    if (!is.null(live_map)) {
+      saveRDS(live_map, cache_file)
+      return(live_map)
+    }
+  }
+
+  if (file.exists(cache_file)) {
+    return(readRDS(cache_file))
+  }
+
+  tibble::tibble(ensembl_gene_id = cleaned, hgnc_symbol = NA_character_)
+}
+
 mapped_counts <- data.frame(ensembl_gene_id = rownames(counts),counts)
 ids<- mapped_counts$ensembl_gene_id
 
-if (any(grepl("^ENSG", strip_ensembl_version(ids)))) {
-  library(biomaRt)
-  ensembl_ids <- unique(strip_ensembl_version(ids))
-  ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+counts_mapped <- mapped_counts %>%
+  mutate(ensembl_gene_id = strip_ensembl_version(ensembl_gene_id))
 
-  map <- getBM(
-    attributes = c("ensembl_gene_id", "hgnc_symbol"),
-    filters = "ensembl_gene_id",
-    values = ensembl_ids,
-    mart = ensembl
-  )
+if (any(grepl("^ENSG", strip_ensembl_version(ids)))) {
+  map <- safe_map_to_hgnc(ids, cache_key = GSE_ID)
 
   kable_head(map, 10, paste(": mapping preview"))
 
 counts_mapped <- mapped_counts %>%
+    mutate(ensembl_gene_id = strip_ensembl_version(ensembl_gene_id)) %>%
     left_join(map, by = "ensembl_gene_id") %>%
   dplyr::select( ensembl_gene_id,hgnc_symbol, everything())
 

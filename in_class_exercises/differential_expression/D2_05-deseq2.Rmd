@@ -38,7 +38,7 @@ dds <- DESeq(dds)
 ```{r}
 res_0_vs_1 <- results(dds,contrast = c("status","0","1"))
 
-summary(res_20_vs_nt)
+summary(res_0_vs_1)
 ```
 
 ## Volcano (red=up, blue=down)
@@ -69,8 +69,6 @@ ggplot(vol, aes(log2FoldChange, neglog10p)) +
 ```{r}
 saveRDS(list(meta = meta, 
              dds = dds, 
-             res_20_vs_nt = res_20_vs_nt,
-             res_3_vs_nt = res_3_vs_nt, 
-             res_20_vs_3 = res_20_vs_3),
+       res_0_vs_1 = res_0_vs_1),
         file = "data/d2_deseq2_results.rds")
 ```
