@@ -11,7 +11,7 @@ library(knitr)
 library(dplyr)
 library(tibble)
 if(!require(tidyverse)){
-  install.packages("tidyvers",dependencies = FALSE)
+  install.packages("tidyverse", dependencies = TRUE)
 }
 library(tidyverse)
 

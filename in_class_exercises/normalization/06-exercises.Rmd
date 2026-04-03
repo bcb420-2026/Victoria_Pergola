@@ -1,24 +1,368 @@
 # Exercises
 These are intended to be done **after** completing the worked examples.
 
+```{r setup_exercises, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.width = 10, fig.height = 5)
+
+library(GEOquery)
+library(edgeR)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(tibble)
+library(stringr)
+
+source("./supp_functions.R")
+
+safe_read <- function(file) {
+  score_expression_table <- function(df) {
+    if (is.null(df) || ncol(df) < 2 || nrow(df) == 0) return(-Inf)
+
+    sample_cols <- df[, -1, drop = FALSE]
+    probe_n <- min(200, nrow(sample_cols))
+    if (probe_n == 0) return(-Inf)
+
+    numeric_ratio <- vapply(sample_cols, function(x) {
+      vals <- readr::parse_number(as.character(utils::head(x, probe_n)))
+      mean(!is.na(vals))
+    }, numeric(1))
+
+    good_numeric_cols <- sum(numeric_ratio > 0.9)
+    # Favor parses that produce many numeric sample columns (typical count matrix shape).
+    good_numeric_cols * 1000 + ncol(df)
+  }
+
+  parsers <- list(
+    tsv = function() read_tsv(file, show_col_types = FALSE),
+    tab = function() read_delim(file, delim = "\t", show_col_types = FALSE, trim_ws = TRUE),
+    ws = function() read_table(file, show_col_types = FALSE),
+    csv = function() read_csv(file, show_col_types = FALSE)
+  )
+
+  parsed <- lapply(parsers, function(fn) tryCatch(fn(), error = function(e) NULL))
+  scores <- vapply(parsed, score_expression_table, numeric(1))
+
+  if (all(!is.finite(scores))) {
+    stop("Could not parse expression file into gene-by-sample table: ", basename(file))
+  }
+
+  parsed[[which.max(scores)]]
+}
+
+find_expression_file <- function(gse) {
+  fetch_geo_supp(gse = gse)
+  path <- file.path("data", gse)
+  files <- list.files(
+    path,
+    pattern = "\\.(txt|tsv|csv)(\\.gz)?$",
+    full.names = TRUE,
+    recursive = TRUE
+  )
+
+  if (length(files) == 0) stop("No expression-like supplementary files found for ", gse)
+
+  # Prefer larger files because they are usually the counts matrix.
+  files[order(file.info(files)$size, decreasing = TRUE)][1]
+}
+
+to_count_matrix <- function(df) {
+  ids <- as.character(df[[1]])
+  mat <- df[, -1, drop = FALSE]
+
+  if (ncol(mat) == 0) {
+    stop("No sample columns detected after removing ID column. Check delimiter/parsing.")
+  }
+
+  if (is.null(colnames(mat)) || length(colnames(mat)) == 0) {
+    colnames(mat) <- paste0("sample_", seq_len(ncol(mat)))
+  }
+  mat[] <- lapply(mat, function(x) readr::parse_number(as.character(x)))
+  mat <- as.matrix(mat)
+  if (ncol(mat) > 0 && (is.null(colnames(mat)) || anyNA(colnames(mat)) || any(colnames(mat) == ""))) {
+    colnames(mat) <- paste0("sample_", seq_len(ncol(mat)))
+  }
+  rownames(mat) <- ids
+
+  keep_rows <- rowSums(!is.na(mat)) > 0
+  mat <- mat[keep_rows, , drop = FALSE]
+  mat[is.na(mat)] <- 0
+  mode(mat) <- "numeric"
+  mat
+}
+
+extract_model_variables <- function(meta) {
+  candidates <- names(meta)[vapply(meta, function(x) is.character(x) || is.factor(x), logical(1))]
+  informative <- candidates[vapply(meta[candidates], function(x) {
+    nx <- length(unique(x))
+    nx > 1 && nx < nrow(meta)
+  }, logical(1))]
+
+  informative[!informative %in% c("geo_accession", "title")]
+}
+
+get_geo_metadata <- function(gse, sample_names) {
+  sample_names <- as.character(sample_names)
+  sample_names <- sample_names[!is.na(sample_names) & sample_names != ""]
+
+  if (length(sample_names) == 0) {
+    return(tibble(sample = character()))
+  }
+
+  gse_obj <- GEOquery::getGEO(gse, GSEMatrix = TRUE, getGPL = FALSE)
+  eset_list <- if (is.list(gse_obj)) gse_obj else list(gse_obj)
+
+  pick_id_column <- function(pd) {
+    id_candidates <- intersect(c("geo_accession", "title", "source_name_ch1", "description"), names(pd))
+    if (length(id_candidates) == 0) {
+      return(list(col = NA_character_, score = 0))
+    }
+
+    scores <- vapply(id_candidates, function(col) {
+      vals <- as.character(pd[[col]])
+      sum(vals %in% sample_names, na.rm = TRUE)
+    }, numeric(1))
+
+    best_col <- id_candidates[which.max(scores)]
+    list(col = best_col, score = max(scores))
+  }
+
+  picks <- lapply(eset_list, function(eset) pick_id_column(pData(eset)))
+  pick_scores <- vapply(picks, function(x) x$score, numeric(1))
+  best_idx <- which.max(pick_scores)
+
+  if (length(best_idx) == 0 || pick_scores[best_idx] == 0) {
+    return(tibble(sample = sample_names))
+  }
+
+  pd <- pData(eset_list[[best_idx]])
+  id_col <- picks[[best_idx]]$col
+
+  meta <- tibble::as_tibble(pd) %>%
+    mutate(sample = .data[[id_col]]) %>%
+    filter(!is.na(sample), sample != "") %>%
+    distinct(sample, .keep_all = TRUE) %>%
+    select(sample, everything())
+
+  matched <- tibble(sample = sample_names) %>%
+    left_join(meta, by = "sample")
+
+  matched
+}
+
+plot_box_colored <- function(mat, meta, color_var, main = "") {
+  df_long <- as.data.frame(mat) %>%
+    mutate(gene = rownames(mat)) %>%
+    pivot_longer(-gene, names_to = "sample", values_to = "value") %>%
+    mutate(value = log2(value + 1)) %>%
+    left_join(meta %>% select(sample, !!sym(color_var)), by = "sample")
+
+  ggplot(df_long, aes(x = sample, y = value, fill = .data[[color_var]])) +
+    geom_boxplot(outlier.size = 0.15) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+    labs(title = main, x = "Sample", y = "log2(counts+1)", fill = color_var)
+}
+
+plot_density_colored <- function(mat, meta, color_var, main = "") {
+  df_long <- as.data.frame(mat) %>%
+    mutate(gene = rownames(mat)) %>%
+    pivot_longer(-gene, names_to = "sample", values_to = "value") %>%
+    mutate(value = log2(value + 1)) %>%
+    left_join(meta %>% select(sample, !!sym(color_var)), by = "sample")
+
+  ggplot(df_long, aes(x = value, colour = .data[[color_var]], group = sample)) +
+    geom_density(alpha = 0.8) +
+    theme_bw() +
+    labs(title = main, x = "log2(counts+1)", y = "Density", colour = color_var)
+}
+
+filter_low_expression <- function(mat, meta = NULL, primary_var = NULL) {
+  if (nrow(mat) == 0 || ncol(mat) == 0) {
+    return(mat)
+  }
+
+  if (!is.null(meta) && !is.null(primary_var) && primary_var %in% names(meta)) {
+    dge <- DGEList(counts = mat, group = factor(meta[[primary_var]]))
+    keep <- filterByExpr(dge)
+  } else {
+    dge <- DGEList(counts = mat)
+    keep <- filterByExpr(dge)
+  }
+
+  mat[keep, , drop = FALSE]
+}
+
+run_distribution_exercise <- function(gse) {
+  expr_file <- find_expression_file(gse)
+  raw_tbl <- safe_read(expr_file)
+  mat <- to_count_matrix(raw_tbl)
+  meta <- get_geo_metadata(gse, colnames(mat))
+  model_vars <- extract_model_variables(meta)
+
+  list(
+    gse = gse,
+    expr_file = expr_file,
+    raw_tbl = raw_tbl,
+    mat = mat,
+    meta = meta,
+    model_vars = model_vars
+  )
+}
+```
+
 ## Exercise 1 — https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE119732
 
-Using **GSE119732**, 
+Using **GSE119732**,
 
-  1. Map the distribution of the samples as a box plot and a density plot using only the raw data.
-  2.  Add colours to the plot separating the different variables in the model
-  3.  Filter out lowly expressed genes and re plot the distributions.
+1. Map the distribution of the samples as a box plot and a density plot using only the raw data.
+2. Add colours to the plot separating the different variables in the model.
+3. Filter out lowly expressed genes and re-plot the distributions.
 
+```{r ex1_prepare}
+ex1 <- run_distribution_exercise("GSE119732")
 
+tibble(
+  GEO = ex1$gse,
+  expression_file = basename(ex1$expr_file),
+  genes = nrow(ex1$mat),
+  samples = ncol(ex1$mat)
+) %>% knitr::kable(caption = "GSE119732 data summary")
+```
+
+### 1) Raw-data distribution plots
+
+```{r ex1_raw_plots}
+plot_box(ex1$mat, main = "GSE119732 raw counts (all genes)")
+plot_density(ex1$mat, main = "GSE119732 raw counts (all genes)")
+```
+
+### 2) Colour by model variables
+
+```{r ex1_model_vars}
+knitr::kable(
+  tibble(model_variable = ex1$model_vars),
+  caption = "Detected model variables for GSE119732"
+)
+```
+
+```{r ex1_colored_plots, fig.height=10}
+if (length(ex1$model_vars) == 0) {
+  message("No informative model variables detected in GEO metadata.")
+} else {
+  vars_to_plot <- ex1$model_vars[1:min(2, length(ex1$model_vars))]
+
+  for (v in vars_to_plot) {
+    print(plot_box_colored(ex1$mat, ex1$meta, v, main = paste("GSE119732 boxplot colored by", v)))
+    print(plot_density_colored(ex1$mat, ex1$meta, v, main = paste("GSE119732 density colored by", v)))
+  }
+}
+```
+
+### 3) Filter low-expression genes and re-plot
+
+```{r ex1_filtered}
+ex1_primary_var <- if (length(ex1$model_vars) > 0) ex1$model_vars[1] else NULL
+ex1_filtered <- filter_low_expression(ex1$mat, ex1$meta, ex1_primary_var)
+
+tibble(
+  stage = c("Before filtering", "After filtering"),
+  genes = c(nrow(ex1$mat), nrow(ex1_filtered))
+) %>% knitr::kable(caption = "GSE119732 gene counts before/after filtering")
+
+plot_box(ex1_filtered, main = "GSE119732 filtered counts")
+plot_density(ex1_filtered, main = "GSE119732 filtered counts")
+```
 
 ## Exercise 2 — https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE122380
 
 Using **GSE122380**, confirm whether the ID column contains Ensembl IDs with version suffixes.
 
- 1. Map the distribution of the samples as a box plot and a density plot using only the raw data.
-  2.  Add colours to the plot separating the different variables in the model
-  3.  Filter out lowly expressed genes and re plot the distributions.
+1. Map the distribution of the samples as a box plot and a density plot using only the raw data.
+2. Add colours to the plot separating the different variables in the model.
+3. Filter out lowly expressed genes and re-plot the distributions.
 
-## Exercise 3 - 
- 
-Can you use the worked example to process the above two GEO records?  How?
+```{r ex2_prepare}
+ex2 <- run_distribution_exercise("GSE122380")
+
+id_col <- names(ex2$raw_tbl)[1]
+first_ids <- as.character(head(ex2$raw_tbl[[id_col]], 20))
+has_version_suffix <- grepl("^ENS[A-Z]*G[0-9]+\\.[0-9]+$", first_ids)
+
+tibble(
+  GEO = ex2$gse,
+  expression_file = basename(ex2$expr_file),
+  genes = nrow(ex2$mat),
+  samples = ncol(ex2$mat)
+) %>% knitr::kable(caption = "GSE122380 data summary")
+
+knitr::kable(
+  tibble(first_20_ids = first_ids, has_version_suffix = has_version_suffix),
+  caption = "GSE122380 ID check (first 20 IDs)"
+)
+
+sprintf(
+  "IDs with Ensembl version suffixes in first 20 rows: %s/20",
+  sum(has_version_suffix)
+)
+```
+
+### 1) Raw-data distribution plots
+
+```{r ex2_raw_plots}
+plot_box(ex2$mat, main = "GSE122380 raw counts (all genes)")
+plot_density(ex2$mat, main = "GSE122380 raw counts (all genes)")
+```
+
+### 2) Colour by model variables
+
+```{r ex2_model_vars}
+knitr::kable(
+  tibble(model_variable = ex2$model_vars),
+  caption = "Detected model variables for GSE122380"
+)
+```
+
+```{r ex2_colored_plots, fig.height=10}
+if (length(ex2$model_vars) == 0) {
+  message("No informative model variables detected in GEO metadata.")
+} else {
+  vars_to_plot <- ex2$model_vars[1:min(2, length(ex2$model_vars))]
+
+  for (v in vars_to_plot) {
+    print(plot_box_colored(ex2$mat, ex2$meta, v, main = paste("GSE122380 boxplot colored by", v)))
+    print(plot_density_colored(ex2$mat, ex2$meta, v, main = paste("GSE122380 density colored by", v)))
+  }
+}
+```
+
+### 3) Filter low-expression genes and re-plot
+
+```{r ex2_filtered}
+ex2_primary_var <- if (length(ex2$model_vars) > 0) ex2$model_vars[1] else NULL
+ex2_filtered <- filter_low_expression(ex2$mat, ex2$meta, ex2_primary_var)
+
+tibble(
+  stage = c("Before filtering", "After filtering"),
+  genes = c(nrow(ex2$mat), nrow(ex2_filtered))
+) %>% knitr::kable(caption = "GSE122380 gene counts before/after filtering")
+
+plot_box(ex2_filtered, main = "GSE122380 filtered counts")
+plot_density(ex2_filtered, main = "GSE122380 filtered counts")
+```
+
+## Exercise 3
+
+Can you use the worked example to process the above two GEO records? How?
+
+Yes. The same worked-example recipe is reusable for both datasets:
+
+1. Download GEO supplementary files.
+2. Read the expression matrix safely across TSV/CSV formats.
+3. Build a gene-by-sample numeric count matrix.
+4. Visualize raw distributions (boxplot + density).
+5. Add metadata/model-aware coloring from GEO sample annotations.
+6. Filter lowly expressed genes with `edgeR::filterByExpr`.
+7. Re-plot distributions after filtering to verify improved comparability.
+
+The helper functions in this chapter (`run_distribution_exercise`, `plot_box_colored`, `plot_density_colored`, `filter_low_expression`) are the generalized implementation of that process.
